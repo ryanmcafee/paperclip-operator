@@ -289,10 +289,10 @@ echo "Admin bootstrap finished successfully."
 								},
 							),
 							EnvFrom:      instance.Spec.EnvFrom,
-							VolumeMounts: buildVolumeMounts(instance),
+							VolumeMounts: bootstrapVolumeMounts(instance),
 						},
 					},
-					Volumes: buildVolumes(instance),
+					Volumes: bootstrapVolumes(instance),
 				},
 			},
 		},
@@ -314,6 +314,27 @@ echo "Admin bootstrap finished successfully."
 // bootstrapSpecHash returns a stable hash over the operator-controlled inputs to
 // the bootstrap Job. It intentionally excludes server-defaulted/mutable fields
 // so a steady-state reconcile produces an identical hash and is a no-op.
+// bootstrapVolumes returns the volumes of the bootstrap Job pod: only the
+// user's spec.extraVolumes (CA bundles and the like for the HTTPS calls).
+//
+// The Job talks to the server over HTTP and writes nothing under /paperclip,
+// yet it used to mount the instance data volume like the server pod. With a
+// ReadWriteOnce block volume (iSCSI, EBS, ...) that mount pins the Job to the
+// server's node: scheduled anywhere else it sat in ContainerCreating with a
+// "Multi-Attach error" until its deadline, so the admin was never created.
+// NFS-backed volumes hid the problem because every node can mount them.
+// Dropping the mount also fixes the Job for instances with spec.extraVolumeMounts,
+// whose mounts referenced volumes the Job never declared.
+func bootstrapVolumes(instance *paperclipv1alpha1.Instance) []corev1.Volume {
+	return append([]corev1.Volume(nil), instance.Spec.ExtraVolumes...)
+}
+
+// bootstrapVolumeMounts mirrors bootstrapVolumes: the user's
+// spec.extraVolumeMounts only, no data or brand volume.
+func bootstrapVolumeMounts(instance *paperclipv1alpha1.Instance) []corev1.VolumeMount {
+	return append([]corev1.VolumeMount(nil), instance.Spec.ExtraVolumeMounts...)
+}
+
 func bootstrapSpecHash(
 	image, script string,
 	admin *paperclipv1alpha1.AdminUserSpec,

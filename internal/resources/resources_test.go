@@ -1928,6 +1928,53 @@ func TestQuotaEnvVarsAbsentWhenUnset(t *testing.T) {
 // only admits the namespace's dynamically allocated UID/GID range, the Job then
 // failed admission with ".spec.securityContext.fsGroup: Invalid value: 1000",
 // never created a pod, and the Instance stayed in Provisioning.
+// The bootstrap Job only calls the server's HTTP API: it must not mount the
+// instance data volume, which on ReadWriteOnce block storage can be attached
+// to one node only and left the Job pod in ContainerCreating ("Multi-Attach
+// error") whenever the scheduler picked a node other than the server's.
+func TestBootstrapJobDoesNotMountDataVolume(t *testing.T) {
+	instance := newTestInstance("my-paperclip")
+	instance.Spec.Auth.AdminUser = &paperclipv1alpha1.AdminUserSpec{
+		Email: "admin@test.com",
+		PasswordSecretRef: corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: "admin-secret"},
+			Key:                  "password",
+		},
+	}
+	instance.Spec.Storage.Persistence.Enabled = Ptr(true)
+	instance.Spec.ExtraVolumes = []corev1.Volume{{
+		Name:         "ca-bundle",
+		VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: "ca-bundle"}}},
+	}}
+	instance.Spec.ExtraVolumeMounts = []corev1.VolumeMount{{Name: "ca-bundle", MountPath: "/etc/ssl/extra", ReadOnly: true}}
+
+	job := BuildBootstrapJob(instance)
+	podSpec := job.Spec.Template.Spec
+	for _, v := range podSpec.Volumes {
+		if v.Name == DataVolumeName || v.Name == BrandVolumeName {
+			t.Errorf("bootstrap Job must not declare volume %q", v.Name)
+		}
+	}
+	for _, m := range podSpec.Containers[0].VolumeMounts {
+		if m.Name == DataVolumeName || m.Name == BrandVolumeName {
+			t.Errorf("bootstrap Job must not mount %q", m.Name)
+		}
+	}
+	// Extra volumes still reach the Job, and every mount refers to a declared volume.
+	declared := map[string]bool{}
+	for _, v := range podSpec.Volumes {
+		declared[v.Name] = true
+	}
+	if !declared["ca-bundle"] {
+		t.Error("expected spec.extraVolumes on the bootstrap Job")
+	}
+	for _, m := range podSpec.Containers[0].VolumeMounts {
+		if !declared[m.Name] {
+			t.Errorf("mount %q refers to a volume the Job does not declare", m.Name)
+		}
+	}
+}
+
 func TestBootstrapJobInheritsPodSecurityContext(t *testing.T) {
 	instance := newTestInstance("my-paperclip")
 	instance.Spec.Auth.AdminUser = &paperclipv1alpha1.AdminUserSpec{
