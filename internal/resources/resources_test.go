@@ -1922,17 +1922,7 @@ func TestQuotaEnvVarsAbsentWhenUnset(t *testing.T) {
 	}
 }
 
-// Regression for issue #111: the bootstrap Job used to hard-code the pod
-// security context (runAsUser/runAsGroup/fsGroup 1000) instead of honoring
-// spec.security.podSecurityContext. On OpenShift, where the restricted-v2 SCC
-// only admits the namespace's dynamically allocated UID/GID range, the Job then
-// failed admission with ".spec.securityContext.fsGroup: Invalid value: 1000",
-// never created a pod, and the Instance stayed in Provisioning.
-// The bootstrap Job only calls the server's HTTP API: it must not mount the
-// instance data volume, which on ReadWriteOnce block storage can be attached
-// to one node only and left the Job pod in ContainerCreating ("Multi-Attach
-// error") whenever the scheduler picked a node other than the server's.
-func TestBootstrapJobDoesNotMountDataVolume(t *testing.T) {
+func newBootstrapTestInstance() *paperclipv1alpha1.Instance {
 	instance := newTestInstance("my-paperclip")
 	instance.Spec.Auth.AdminUser = &paperclipv1alpha1.AdminUserSpec{
 		Email: "admin@test.com",
@@ -1941,29 +1931,79 @@ func TestBootstrapJobDoesNotMountDataVolume(t *testing.T) {
 			Key:                  "password",
 		},
 	}
+	return instance
+}
+
+// Regression for issue #119: on ReadWriteOnce block storage the bootstrap Job
+// pod could land on a node other than the server's and sit in
+// ContainerCreating ("Multi-Attach error") until its deadline. The Job still
+// needs the data volume (bootstrap-ceo reads the instance config from it), so
+// it must be co-located with the server pod instead.
+func TestBootstrapJobCoLocatedWithServerOnRWOStorage(t *testing.T) {
+	instance := newBootstrapTestInstance()
 	instance.Spec.Storage.Persistence.Enabled = Ptr(true)
+
+	podSpec := BuildBootstrapJob(instance).Spec.Template.Spec
+
+	var hasData bool
+	for _, v := range podSpec.Volumes {
+		if v.Name == DataVolumeName {
+			hasData = v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == PVCName(instance)
+		}
+	}
+	if !hasData {
+		t.Fatal("bootstrap Job must mount the instance data PVC: bootstrap-ceo reads the instance config from it")
+	}
+
+	aff := podSpec.Affinity
+	if aff == nil || aff.PodAffinity == nil ||
+		len(aff.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution) != 1 {
+		t.Fatalf("expected one required pod affinity term, got %+v", aff)
+	}
+	term := aff.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution[0]
+	if term.TopologyKey != "kubernetes.io/hostname" {
+		t.Errorf("expected hostname topology key, got %q", term.TopologyKey)
+	}
+	if !equality.Semantic.DeepEqual(term.LabelSelector.MatchLabels, SelectorLabels(instance)) {
+		t.Errorf("affinity must select the server pods, got %v", term.LabelSelector.MatchLabels)
+	}
+}
+
+func TestBootstrapJobNoAffinityWithoutSingleNodeVolume(t *testing.T) {
+	rwx := newBootstrapTestInstance()
+	rwx.Spec.Storage.Persistence.Enabled = Ptr(true)
+	rwx.Spec.Storage.Persistence.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
+	if a := BuildBootstrapJob(rwx).Spec.Template.Spec.Affinity; a != nil {
+		t.Errorf("ReadWriteMany volume needs no co-location, got %+v", a)
+	}
+
+	ephemeral := newBootstrapTestInstance()
+	ephemeral.Spec.Storage.Persistence.Enabled = Ptr(false)
+	if a := BuildBootstrapJob(ephemeral).Spec.Template.Spec.Affinity; a != nil {
+		t.Errorf("emptyDir data volume needs no co-location, got %+v", a)
+	}
+}
+
+// The Job used to mount spec.extraVolumeMounts without declaring
+// spec.extraVolumes, and it does not need the brand-assets volume.
+func TestBootstrapJobVolumesAreConsistent(t *testing.T) {
+	instance := newBootstrapTestInstance()
+	instance.Spec.Branding = &paperclipv1alpha1.BrandingSpec{
+		CSSConfigMapRef: &corev1.LocalObjectReference{Name: "brand"},
+	}
 	instance.Spec.ExtraVolumes = []corev1.Volume{{
 		Name:         "ca-bundle",
 		VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: "ca-bundle"}}},
 	}}
 	instance.Spec.ExtraVolumeMounts = []corev1.VolumeMount{{Name: "ca-bundle", MountPath: "/etc/ssl/extra", ReadOnly: true}}
 
-	job := BuildBootstrapJob(instance)
-	podSpec := job.Spec.Template.Spec
-	for _, v := range podSpec.Volumes {
-		if v.Name == DataVolumeName || v.Name == BrandVolumeName {
-			t.Errorf("bootstrap Job must not declare volume %q", v.Name)
-		}
-	}
-	for _, m := range podSpec.Containers[0].VolumeMounts {
-		if m.Name == DataVolumeName || m.Name == BrandVolumeName {
-			t.Errorf("bootstrap Job must not mount %q", m.Name)
-		}
-	}
-	// Extra volumes still reach the Job, and every mount refers to a declared volume.
+	podSpec := BuildBootstrapJob(instance).Spec.Template.Spec
 	declared := map[string]bool{}
 	for _, v := range podSpec.Volumes {
 		declared[v.Name] = true
+	}
+	if declared[BrandVolumeName] {
+		t.Error("bootstrap Job must not declare the brand volume")
 	}
 	if !declared["ca-bundle"] {
 		t.Error("expected spec.extraVolumes on the bootstrap Job")
@@ -1975,6 +2015,26 @@ func TestBootstrapJobDoesNotMountDataVolume(t *testing.T) {
 	}
 }
 
+// Changing the scheduling inputs must change the hash so a Job created before
+// the issue #119 fix is replaced instead of kept until it times out.
+func TestBootstrapHashCoversAffinity(t *testing.T) {
+	rwo := newBootstrapTestInstance()
+	rwo.Spec.Storage.Persistence.Enabled = Ptr(true)
+	rwx := newBootstrapTestInstance()
+	rwx.Spec.Storage.Persistence.Enabled = Ptr(true)
+	rwx.Spec.Storage.Persistence.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
+	if BuildBootstrapJob(rwo).Annotations[BootstrapHashAnnotation] ==
+		BuildBootstrapJob(rwx).Annotations[BootstrapHashAnnotation] {
+		t.Error("bootstrap hash must change when the Job affinity changes")
+	}
+}
+
+// Regression for issue #111: the bootstrap Job used to hard-code the pod
+// security context (runAsUser/runAsGroup/fsGroup 1000) instead of honoring
+// spec.security.podSecurityContext. On OpenShift, where the restricted-v2 SCC
+// only admits the namespace's dynamically allocated UID/GID range, the Job then
+// failed admission with ".spec.securityContext.fsGroup: Invalid value: 1000",
+// never created a pod, and the Instance stayed in Provisioning.
 func TestBootstrapJobInheritsPodSecurityContext(t *testing.T) {
 	instance := newTestInstance("my-paperclip")
 	instance.Spec.Auth.AdminUser = &paperclipv1alpha1.AdminUserSpec{

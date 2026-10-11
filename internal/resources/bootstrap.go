@@ -260,6 +260,7 @@ echo "Admin bootstrap finished successfully."
 					NodeSelector:                 instance.Spec.Availability.NodeSelector,
 					Tolerations:                  instance.Spec.Availability.Tolerations,
 					ImagePullSecrets:             instance.Spec.Image.PullSecrets,
+					Affinity:                     bootstrapAffinity(instance),
 					// spec.security.podSecurityContext must reach this Job just
 					// like it reaches the server pod template. Hard-coding the
 					// UID/GID 1000 default here made the Job fail admission
@@ -306,39 +307,81 @@ echo "Admin bootstrap finished successfully."
 		job.Annotations = map[string]string{}
 	}
 	job.Annotations[BootstrapHashAnnotation] = bootstrapSpecHash(
-		image, script, admin, job.Spec.Template.Spec.SecurityContext)
+		image, script, admin, &job.Spec.Template.Spec)
 
 	return job
+}
+
+// bootstrapVolumes returns the volumes of the bootstrap Job pod: the instance
+// data volume plus the user's spec.extraVolumes. The brand-assets volume is
+// not needed by the Job and is left out.
+//
+// The data volume IS needed: the script's `paperclipai auth bootstrap-ceo`
+// step reads the instance config the onboard init container wrote to
+// /paperclip/instances/default/config.json (without it the CLI prints "No
+// config found" and no invite token is minted). Because that volume is
+// usually ReadWriteOnce, the Job is co-located with the server pod by
+// bootstrapAffinity instead of being allowed to land on another node, where
+// it sat in ContainerCreating with a "Multi-Attach error" until its deadline
+// (issue #119).
+//
+// spec.extraVolumes is declared here too: buildVolumeMounts has always mounted
+// spec.extraVolumeMounts, so without the matching volumes an Instance with
+// extra mounts produced a Job pod that referenced undeclared volumes.
+func bootstrapVolumes(instance *paperclipv1alpha1.Instance) []corev1.Volume {
+	volumes := make([]corev1.Volume, 0, 1+len(instance.Spec.ExtraVolumes))
+	for _, v := range buildVolumes(instance) {
+		if v.Name == DataVolumeName {
+			volumes = append(volumes, v)
+		}
+	}
+	return append(volumes, instance.Spec.ExtraVolumes...)
+}
+
+// bootstrapVolumeMounts mirrors bootstrapVolumes: the data volume at
+// /paperclip plus the user's spec.extraVolumeMounts, no brand volume.
+func bootstrapVolumeMounts(instance *paperclipv1alpha1.Instance) []corev1.VolumeMount {
+	mounts := make([]corev1.VolumeMount, 0, 1+len(instance.Spec.ExtraVolumeMounts))
+	mounts = append(mounts, corev1.VolumeMount{
+		Name:      DataVolumeName,
+		MountPath: DataMountPath,
+	})
+	return append(mounts, instance.Spec.ExtraVolumeMounts...)
+}
+
+// bootstrapAffinity pins the bootstrap Job pod to a node that runs a server
+// pod of the same Instance whenever the data volume can only be attached to a
+// single node. A ReadWriteOnce volume can be mounted by several pods as long
+// as they share a node, so co-location is what lets the Job read the instance
+// config on block storage (iSCSI, EBS, Ceph RBD, ...) instead of failing with
+// a "Multi-Attach error" (issue #119). Shared-filesystem access modes
+// (ReadWriteMany / ReadOnlyMany) and the emptyDir fallback need no pinning.
+func bootstrapAffinity(instance *paperclipv1alpha1.Instance) *corev1.Affinity {
+	if !PersistenceEnabled(instance) {
+		return nil
+	}
+	for _, mode := range instance.Spec.Storage.Persistence.AccessModes {
+		if mode == corev1.ReadWriteMany || mode == corev1.ReadOnlyMany {
+			return nil
+		}
+	}
+	return &corev1.Affinity{
+		PodAffinity: &corev1.PodAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+				LabelSelector: &metav1.LabelSelector{MatchLabels: SelectorLabels(instance)},
+				TopologyKey:   "kubernetes.io/hostname",
+			}},
+		},
+	}
 }
 
 // bootstrapSpecHash returns a stable hash over the operator-controlled inputs to
 // the bootstrap Job. It intentionally excludes server-defaulted/mutable fields
 // so a steady-state reconcile produces an identical hash and is a no-op.
-// bootstrapVolumes returns the volumes of the bootstrap Job pod: only the
-// user's spec.extraVolumes (CA bundles and the like for the HTTPS calls).
-//
-// The Job talks to the server over HTTP and writes nothing under /paperclip,
-// yet it used to mount the instance data volume like the server pod. With a
-// ReadWriteOnce block volume (iSCSI, EBS, ...) that mount pins the Job to the
-// server's node: scheduled anywhere else it sat in ContainerCreating with a
-// "Multi-Attach error" until its deadline, so the admin was never created.
-// NFS-backed volumes hid the problem because every node can mount them.
-// Dropping the mount also fixes the Job for instances with spec.extraVolumeMounts,
-// whose mounts referenced volumes the Job never declared.
-func bootstrapVolumes(instance *paperclipv1alpha1.Instance) []corev1.Volume {
-	return append([]corev1.Volume(nil), instance.Spec.ExtraVolumes...)
-}
-
-// bootstrapVolumeMounts mirrors bootstrapVolumes: the user's
-// spec.extraVolumeMounts only, no data or brand volume.
-func bootstrapVolumeMounts(instance *paperclipv1alpha1.Instance) []corev1.VolumeMount {
-	return append([]corev1.VolumeMount(nil), instance.Spec.ExtraVolumeMounts...)
-}
-
 func bootstrapSpecHash(
 	image, script string,
 	admin *paperclipv1alpha1.AdminUserSpec,
-	podSecurityContext *corev1.PodSecurityContext,
+	podSpec *corev1.PodSpec,
 ) string {
 	// The script already embeds the resolved admin name, service/base URLs and
 	// the JSON sign-up payload, so it captures most config drift. Include the
@@ -350,16 +393,25 @@ func bootstrapSpecHash(
 	// would keep the stale (and, on OpenShift, unschedulable) Job forever
 	// (issue #111). encoding/json emits struct fields in declaration order, so
 	// this serialization is stable across reconciles.
-	securityContextJSON, err := json.Marshal(podSecurityContext)
-	if err != nil {
-		// PodSecurityContext is a plain API struct and cannot fail to marshal;
-		// fall back to a constant rather than panicking in a builder.
-		securityContextJSON = []byte("unmarshalable")
-	}
-	payload := fmt.Sprintf("image=%s\x00script=%s\x00email=%s\x00secret=%s/%s\x00podSecurityContext=%s\x00",
+	//
+	// The volumes and affinity are hashed for the same reason: a Job created
+	// before the issue #119 fix (no co-location, undeclared extra volumes) must
+	// be replaced rather than kept until it times out.
+	payload := fmt.Sprintf("image=%s\x00script=%s\x00email=%s\x00secret=%s/%s\x00podSecurityContext=%s\x00volumes=%s\x00affinity=%s\x00",
 		image, script, admin.Email,
 		admin.PasswordSecretRef.Name, admin.PasswordSecretRef.Key,
-		securityContextJSON)
+		mustJSON(podSpec.SecurityContext), mustJSON(podSpec.Volumes), mustJSON(podSpec.Affinity))
 	sum := sha256.Sum256([]byte(payload))
 	return hex.EncodeToString(sum[:])
+}
+
+// mustJSON serializes a plain Kubernetes API value for hashing. These structs
+// cannot fail to marshal; fall back to a constant rather than panicking in a
+// builder.
+func mustJSON(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "unmarshalable"
+	}
+	return string(b)
 }
